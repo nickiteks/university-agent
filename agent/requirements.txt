@@ -1,0 +1,2 @@
+langgraph>=0.2
+fastmcp>=3.4
