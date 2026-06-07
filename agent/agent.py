@@ -4,12 +4,12 @@ Agent service для MVP.
 Граф построен через LangGraph из двух нод:
 agent <-> toolnode
 
-agent выбирает следующий MCP tool из skills.txt.
+agent вызывает LLM, которая выбирает следующий MCP tool из skills.txt.
 toolnode вызывает выбранный MCP tool.
 Цикл идёт, пока не выполнены все функции сценария.
 
 ReAct-логика находится в связке agent/toolnode:
-- agent выбирает следующий tool;
+- agent получает Thought/Action от LLM;
 - toolnode вызывает tool из MCP;
 - сам MCP tool проверяет аргументы и риск;
 - если нужны данные или подтверждение, tool делает interrupt через state;
@@ -35,6 +35,12 @@ from langgraph.graph import END, StateGraph
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+VLLM_CLIENT_DIR = PROJECT_DIR / "vllm-client"
+
+if str(VLLM_CLIENT_DIR) not in sys.path:
+    sys.path.append(str(VLLM_CLIENT_DIR))
+
+from vllm_usage import VLLMClient  # noqa: E402
 
 
 class AgentState(TypedDict, total=False):
@@ -63,6 +69,8 @@ class AgentState(TypedDict, total=False):
     next_tool: str
     completed_tools: list
     react_trace: list
+    llm_plan: list
+    llm_decisions: list
     waiting_for_user: bool
     pending_question: dict
     missing_arguments: list
@@ -154,13 +162,15 @@ class MCPClient:
 class ResearchAgent:
     """Агентный помощник исследователя университета."""
 
-    def __init__(self, security_client=None, mcp_client=None):
+    def __init__(self, security_client=None, mcp_client=None, llm_client=None):
         """Собрать зависимости агента и построить LangGraph-граф."""
 
         self.security = security_client or SecurityClient()
         self.mcp = mcp_client or MCPClient()
         self.skills_text = self.load_skills()
         self.scenario_tools = self.load_scenario_tools()
+        self.llm = llm_client or VLLMClient()
+        self.system_prompt = self.build_system_prompt()
         self.graph = self.build_graph()
 
     def load_skills(self):
@@ -205,6 +215,33 @@ class ResearchAgent:
             )
 
         return scenario_tools
+
+    def build_system_prompt(self):
+        """Собрать системную инструкцию для LLM-выбора ReAct action."""
+
+        skills = json.dumps(self.scenario_tools, ensure_ascii=False, indent=2)
+        return (
+            "Ты ReAct-агент университетской AI-платформы.\n"
+            "Твоя задача - выбирать следующий MCP tool из skills и строить "
+            "последовательность действий для выполнения запроса пользователя.\n\n"
+            "Доступные skills/tools:\n"
+            f"{skills}\n\n"
+            "Правила:\n"
+            "1. Работай в цикле Thought -> Action -> Observation.\n"
+            "2. На каждом шаге выбирай ровно один tool из списка skills или finish.\n"
+            "3. Сначала всегда выбирай auth_context, чтобы проверить auth context.\n"
+            "4. Не придумывай tools, аргументы, права доступа или источники.\n"
+            "5. Используй только данные state, observations и список skills.\n"
+            "6. Рискованные действия не подтверждай сам: MCP tool сам остановит "
+            "граф и запросит подтверждение пользователя.\n"
+            "7. finish выбирай только если все нужные skills выполнены или state.stop=true.\n\n"
+            "Формат ответа - только JSON без markdown:\n"
+            "{\n"
+            '  "thought": "почему выбран этот tool",\n'
+            '  "tool": "technical_tool_name_or_finish",\n'
+            '  "planned_tools": ["ordered", "technical", "tool", "names"]\n'
+            "}"
+        )
 
     def build_graph(self):
         """Построить LangGraph из двух нод: agent и toolnode."""
@@ -253,11 +290,13 @@ class ResearchAgent:
             "scenario_tools": self.scenario_tools,
             "current_tool_index": 0,
             "completed_tools": [],
+            "llm_plan": [],
+            "llm_decisions": [],
         }
         return self.graph.invoke(state, {"recursion_limit": 50})
 
     def agent_node(self, state):
-        """Нода agent выбирает следующую функцию из сценария."""
+        """Нода agent через LLM выбирает следующую функцию из skills."""
 
         state = dict(state)
         state["graph_steps"].append("agent")
@@ -270,17 +309,193 @@ class ResearchAgent:
             state["next_tool"] = "finish"
             return state
 
-        current_tool = state["scenario_tools"][state["current_tool_index"]]
-        state["next_tool"] = current_tool["name"]
+        decision = self.select_next_tool(state)
+        state["next_tool"] = decision["tool"]
+        state["llm_plan"] = decision.get("planned_tools", [])
+        state["llm_decisions"].append(decision)
         state["react_trace"].append(
             {
-                "thought": "Выбран следующий tool из сценария.",
-                "tool": current_tool["name"],
+                "thought": decision["thought"],
+                "tool": decision["tool"],
                 "action": "select_tool",
+                "source": decision["source"],
             }
         )
 
         return state
+
+    def select_next_tool(self, state):
+        """Получить LLM-решение и привести его к валидному ReAct action."""
+
+        raw_response = ""
+        try:
+            raw_response = self.llm.complete(
+                self.system_prompt,
+                self.build_llm_user_prompt(state),
+            )
+            parsed_decision = self.parse_llm_decision(raw_response)
+        except Exception as exc:  # noqa: BLE001
+            parsed_decision = {
+                "validation_error": f"llm_error:{exc.__class__.__name__}",
+            }
+
+        return self.validate_llm_decision(state, parsed_decision, raw_response)
+
+    def build_llm_user_prompt(self, state):
+        """Собрать компактный state snapshot для выбора следующего tool."""
+
+        snapshot = {
+            "user_message": state.get("message", ""),
+            "completed_tools": state.get("completed_tools", []),
+            "remaining_tools": self.remaining_scenario_tools(state),
+            "current_observations": self.build_observation_snapshot(state),
+            "existing_llm_plan": state.get("llm_plan", []),
+        }
+        return (
+            "Выбери следующий ReAct Action для текущего состояния.\n"
+            "Ответь строго JSON по системной схеме.\n\n"
+            f"State:\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
+        )
+
+    def build_observation_snapshot(self, state):
+        """Оставить для LLM только безопасные и полезные поля state."""
+
+        auth_context = state.get("auth_context", {})
+        agent_context = auth_context.get("agent_context", {})
+        return {
+            "authenticated": auth_context.get("authenticated"),
+            "user_id": state.get("user_id"),
+            "intent": state.get("intent"),
+            "project_type": state.get("project_type"),
+            "allowed_actions": agent_context.get("allowed_actions", []),
+            "allowed_document_ids": auth_context.get("allowed_document_ids", []),
+            "sources": [source.get("id") for source in state.get("sources", [])],
+            "missing_documents_count": len(state.get("missing_documents", [])),
+            "application_structure_ready": bool(state.get("application_structure")),
+            "planned_tasks_count": len(state.get("planned_tasks", [])),
+            "created_tasks_count": len(state.get("created_tasks", [])),
+            "email_draft_id": state.get("email_draft", {}).get("id"),
+            "quality": state.get("quality"),
+            "errors": state.get("errors", []),
+            "waiting_for_user": state.get("waiting_for_user", False),
+            "requires_confirmation": state.get("requires_confirmation", False),
+            "stop": state.get("stop", False),
+        }
+
+    def parse_llm_decision(self, raw_response):
+        """Достать JSON-решение из ответа модели."""
+
+        if not raw_response:
+            return {"validation_error": "empty_llm_response"}
+
+        text = raw_response.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:].strip()
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = self.extract_json_object(text)
+
+        if not isinstance(parsed, dict):
+            return {"validation_error": "llm_response_is_not_json_object"}
+
+        return parsed
+
+    def extract_json_object(self, text):
+        """Найти первый JSON object в ответе, если модель добавила текст вокруг."""
+
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(text):
+            if character != "{":
+                continue
+
+            try:
+                parsed, _ = decoder.raw_decode(text[index:])
+                return parsed
+            except json.JSONDecodeError:
+                continue
+
+        return {"validation_error": "json_object_not_found"}
+
+    def validate_llm_decision(self, state, decision, raw_response):
+        """Проверить tool от LLM и при необходимости заменить fallback action."""
+
+        fallback_tool = self.next_scenario_tool(state)
+        requested_tool = decision.get("tool")
+        planned_tools = self.normalize_planned_tools(decision.get("planned_tools", []))
+        validation_error = decision.get("validation_error")
+
+        if state.get("stop"):
+            requested_tool = "finish"
+        elif requested_tool != fallback_tool:
+            validation_error = validation_error or (
+                f"expected_{fallback_tool}_got_{requested_tool}"
+            )
+            requested_tool = fallback_tool
+
+        if requested_tool not in self.allowed_tool_names():
+            validation_error = validation_error or f"unknown_tool:{requested_tool}"
+            requested_tool = fallback_tool
+
+        if not planned_tools:
+            planned_tools = self.remaining_scenario_tools(state)
+
+        source = "llm"
+        thought = decision.get("thought") or "LLM выбрала следующий tool из skills."
+        if validation_error:
+            source = "fallback"
+            thought = (
+                "LLM-решение не прошло валидацию; выбран следующий валидный "
+                "tool из skills."
+            )
+
+        return {
+            "thought": thought,
+            "tool": requested_tool,
+            "planned_tools": planned_tools,
+            "source": source,
+            "raw_response": raw_response,
+            "validation_error": validation_error,
+        }
+
+    def normalize_planned_tools(self, planned_tools):
+        """Оставить в плане только известные technical tool names."""
+
+        if not isinstance(planned_tools, list):
+            return []
+
+        known_tools = self.allowed_tool_names()
+        normalized_tools = []
+        for tool_name in planned_tools:
+            if tool_name in known_tools and tool_name not in normalized_tools:
+                normalized_tools.append(tool_name)
+
+        return normalized_tools
+
+    def allowed_tool_names(self):
+        """Вернуть множество допустимых имен tools и finish."""
+
+        return {tool["name"] for tool in self.scenario_tools} | {"finish"}
+
+    def next_scenario_tool(self, state):
+        """Вернуть следующий обязательный tool в последовательности skills."""
+
+        current_index = state.get("current_tool_index", 0)
+        scenario_tools = state.get("scenario_tools", self.scenario_tools)
+        if current_index >= len(scenario_tools):
+            return "finish"
+
+        return scenario_tools[current_index]["name"]
+
+    def remaining_scenario_tools(self, state):
+        """Вернуть оставшуюся последовательность technical tool names."""
+
+        current_index = state.get("current_tool_index", 0)
+        scenario_tools = state.get("scenario_tools", self.scenario_tools)
+        return [tool["name"] for tool in scenario_tools[current_index:]]
 
     def route_after_agent(self, state):
         """Решить, идти ли в toolnode или завершать граф."""
@@ -303,6 +518,14 @@ class ResearchAgent:
             },
         )
         state = self.apply_mcp_result(state, result)
+        state["react_trace"].append(
+            {
+                "thought": "Observation результата MCP tool сохранён в state.",
+                "tool": tool_name,
+                "action": "observation",
+                "observation_keys": sorted(result.keys()),
+            }
+        )
 
         if not state.get("waiting_for_user"):
             state["current_tool_index"] += 1

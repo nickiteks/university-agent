@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -70,6 +71,46 @@ class TestLLMClient:
         return "Коллеги, прошу согласовать черновик заявки."
 
 
+class TestAgentLLMClient:
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, system_prompt, user_prompt):
+        self.calls.append(
+            {
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+            }
+        )
+        state = self.extract_state(user_prompt)
+        tool_name = state["remaining_tools"][0]
+        return json.dumps(
+            {
+                "thought": "Выбираю следующий tool из skills.",
+                "tool": tool_name,
+                "planned_tools": state["remaining_tools"],
+            },
+            ensure_ascii=False,
+        )
+
+    def extract_state(self, user_prompt):
+        marker = "State:\n"
+        state_json = user_prompt.split(marker, 1)[1]
+        return json.loads(state_json)
+
+
+class WrongToolAgentLLMClient:
+    def complete(self, system_prompt, user_prompt):
+        return json.dumps(
+            {
+                "thought": "Ошибочно выбираю финальный аудит слишком рано.",
+                "tool": "write_audit",
+                "planned_tools": ["write_audit"],
+            },
+            ensure_ascii=False,
+        )
+
+
 class ResearchAgentTest(unittest.TestCase):
     def setUp(self):
         data.TASKS.clear()
@@ -77,10 +118,12 @@ class ResearchAgentTest(unittest.TestCase):
         data.AUDIT_LOGS.clear()
 
         self.llm = TestLLMClient()
+        self.agent_llm = TestAgentLLMClient()
         mcp_module.llm_client = self.llm
         self.agent = ResearchAgent(
             security_client=TestSecurityClient(),
             mcp_client=MCPClient(),
+            llm_client=self.agent_llm,
         )
 
     def test_agent_prepares_package_without_creating_tasks_before_confirmation(self):
@@ -104,6 +147,9 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(1, len(result["planned_tasks"]))
         self.assertEqual("email_draft_1", result["email_draft"]["id"])
         self.assertEqual(1, len(self.llm.calls))
+        self.assertEqual(len(self.agent.scenario_tools), len(self.agent_llm.calls))
+        self.assertIn("ReAct-агент", self.agent_llm.calls[0]["system_prompt"])
+        self.assertIn("auth_context", self.agent_llm.calls[0]["system_prompt"])
         self.assertIn("doc_reg_internal_2026", [source["id"] for source in result["sources"]])
 
     def test_agent_creates_tasks_after_confirmation(self):
@@ -155,6 +201,7 @@ class ResearchAgentTest(unittest.TestCase):
         agent = ResearchAgent(
             security_client=TestSecurityClient(permissions=["documents.read", "email.draft"]),
             mcp_client=MCPClient(),
+            llm_client=TestAgentLLMClient(),
         )
 
         result = agent.run(
@@ -174,6 +221,29 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(["agent", "toolnode", "agent"], result["graph_steps"])
         self.assertEqual(["auth_context"], result["completed_tools"])
         self.assertEqual("Нет доступа: токен не прошёл проверку Keycloak.", result["final_answer"])
+
+    def test_agent_uses_llm_decision_for_react_action(self):
+        result = self.agent.run("valid-token", "Подготовь заявку")
+
+        expected_tools = [tool["name"] for tool in self.agent.scenario_tools]
+        selected_tools = [decision["tool"] for decision in result["llm_decisions"]]
+
+        self.assertEqual(expected_tools, selected_tools)
+        self.assertEqual("llm", result["llm_decisions"][0]["source"])
+        self.assertEqual("select_tool", result["react_trace"][0]["action"])
+
+    def test_agent_falls_back_when_llm_selects_invalid_tool_order(self):
+        agent = ResearchAgent(
+            security_client=TestSecurityClient(),
+            mcp_client=MCPClient(),
+            llm_client=WrongToolAgentLLMClient(),
+        )
+
+        result = agent.run("valid-token", "Подготовь заявку")
+
+        self.assertEqual("auth_context", result["llm_decisions"][0]["tool"])
+        self.assertEqual("fallback", result["llm_decisions"][0]["source"])
+        self.assertEqual("auth_context", result["completed_tools"][0])
 
     def test_agent_uses_only_allowed_sources(self):
         result = self.agent.run("valid-token", "Найди регламенты и памятки")
