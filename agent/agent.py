@@ -4,9 +4,9 @@ Agent service для MVP.
 Граф построен через LangGraph из двух нод:
 agent <-> toolnode
 
-agent вызывает LLM, которая выбирает следующий MCP tool из skills.txt.
+agent вызывает LLM, которая выбирает business process и план MCP tools из skills.txt.
 toolnode вызывает выбранный MCP tool.
-Цикл идёт, пока не выполнены все функции сценария.
+Цикл идёт, пока не выполнены tools из LLM-плана.
 
 ReAct-логика находится в связке agent/toolnode:
 - agent получает Thought/Action от LLM;
@@ -22,15 +22,18 @@ ReAct-логика находится в связке agent/toolnode:
 """
 
 import asyncio
+import copy
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import sys
 from typing import TypedDict
+import uuid
 from urllib import error, request
 
 from fastmcp import Client
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 
@@ -45,6 +48,7 @@ from vllm_usage import VLLMClient  # noqa: E402
 
 class AgentState(TypedDict, total=False):
     access_token: str
+    thread_id: str
     message: str
     user_arguments: dict
     confirmations: dict
@@ -65,6 +69,8 @@ class AgentState(TypedDict, total=False):
     requires_confirmation: bool
     graph_steps: list
     scenario_tools: list
+    business_processes: list
+    selected_business_process: str
     current_tool_index: int
     next_tool: str
     completed_tools: list
@@ -162,15 +168,24 @@ class MCPClient:
 class ResearchAgent:
     """Агентный помощник исследователя университета."""
 
-    def __init__(self, security_client=None, mcp_client=None, llm_client=None):
+    def __init__(
+        self,
+        security_client=None,
+        mcp_client=None,
+        llm_client=None,
+        checkpointer=None,
+    ):
         """Собрать зависимости агента и построить LangGraph-граф."""
 
         self.security = security_client or SecurityClient()
         self.mcp = mcp_client or MCPClient()
         self.skills_text = self.load_skills()
-        self.scenario_tools = self.load_scenario_tools()
+        self.business_processes = self.load_business_processes()
+        self.scenario_tools = self.default_process_tools()
         self.llm = llm_client or VLLMClient()
         self.system_prompt = self.build_system_prompt()
+        self.checkpointer = checkpointer or MemorySaver()
+        self.thread_states = {}
         self.graph = self.build_graph()
 
     def load_skills(self):
@@ -179,66 +194,119 @@ class ResearchAgent:
         skills_path = Path(__file__).resolve().parent / "skills.txt"
         return skills_path.read_text(encoding="utf-8")
 
-    def load_scenario_tools(self):
-        """Связать шаги skills.txt с техническими именами MCP/tools функций."""
+    def load_business_processes(self):
+        """Прочитать business processes и tools из skills.txt."""
 
-        # Технические имена tool идут в том же порядке, что шаги в skills.txt.
-        tool_names = [
-            "auth_context",
-            "detect_intent",
-            "search_knowledge",
-            "check_requirements",
-            "list_missing_documents",
-            "prepare_application_structure",
-            "prepare_tasks",
-            "prepare_email_draft",
-            "quality_check",
-            "write_audit",
-        ]
+        processes = []
+        process = None
+        in_description = False
 
-        descriptions = []
+        def new_process(name):
+            process_number = len(processes) + 1
+            return {
+                "id": f"business_process_{process_number}",
+                "name": name,
+                "description": "",
+                "tools": [],
+                "recommended_sequence": [],
+            }
+
+        def append_process(current_process):
+            if current_process is None:
+                return
+
+            if not current_process["recommended_sequence"]:
+                current_process["recommended_sequence"] = [
+                    tool["name"] for tool in current_process["tools"]
+                ]
+
+            processes.append(current_process)
+
         for line in self.skills_text.splitlines():
             text = line.strip()
-            step_number = len(descriptions) + 1
+            if not text:
+                continue
 
-            if text.startswith(f"{step_number}."):
-                description = text.split(".", 1)[1].strip()
-                descriptions.append(description)
+            if text.startswith("Скилл:"):
+                append_process(process)
+                process = new_process(text.split(":", 1)[1].strip())
+                in_description = False
+                continue
 
-        scenario_tools = []
-        for index, tool_name in enumerate(tool_names):
-            scenario_tools.append(
-                {
-                    "name": tool_name,
-                    "description": descriptions[index],
-                }
-            )
+            if process is None:
+                continue
 
-        return scenario_tools
+            if text.startswith("process_id:"):
+                process["id"] = text.split(":", 1)[1].strip()
+                in_description = False
+                continue
+
+            if text == "Описание:":
+                in_description = True
+                continue
+
+            if text.endswith(":"):
+                in_description = False
+                continue
+
+            if in_description:
+                process["description"] = text
+                continue
+
+            if text.startswith("- ") and ":" in text:
+                tool_name, description = text[2:].split(":", 1)
+                process["tools"].append(
+                    {
+                        "name": tool_name.strip(),
+                        "description": description.strip(),
+                    }
+                )
+                continue
+
+            if "->" in text:
+                process["recommended_sequence"] = [
+                    tool_name.strip() for tool_name in text.split("->")
+                ]
+
+        append_process(process)
+
+        return processes
+
+    def default_process_tools(self):
+        """Вернуть tools первого business process для обратной совместимости."""
+
+        if not self.business_processes:
+            return []
+
+        return self.business_processes[0]["tools"]
 
     def build_system_prompt(self):
-        """Собрать системную инструкцию для LLM-выбора ReAct action."""
+        """Собрать системную инструкцию для LLM-планирования ReAct workflow."""
 
-        skills = json.dumps(self.scenario_tools, ensure_ascii=False, indent=2)
+        processes = json.dumps(self.business_processes, ensure_ascii=False, indent=2)
         return (
             "Ты ReAct-агент университетской AI-платформы.\n"
-            "Твоя задача - выбирать следующий MCP tool из skills и строить "
-            "последовательность действий для выполнения запроса пользователя.\n\n"
-            "Доступные skills/tools:\n"
-            f"{skills}\n\n"
+            "Твоя задача - выбрать business process из skills.txt и сформировать "
+            "последовательность MCP tools для выполнения запроса пользователя.\n\n"
+            "Доступные business processes и tools:\n"
+            f"{processes}\n\n"
+            "Полный текст skills.txt:\n"
+            f"{self.skills_text}\n\n"
             "Правила:\n"
-            "1. Работай в цикле Thought -> Action -> Observation.\n"
-            "2. На каждом шаге выбирай ровно один tool из списка skills или finish.\n"
-            "3. Сначала всегда выбирай auth_context, чтобы проверить auth context.\n"
-            "4. Не придумывай tools, аргументы, права доступа или источники.\n"
-            "5. Используй только данные state, observations и список skills.\n"
-            "6. Рискованные действия не подтверждай сам: MCP tool сам остановит "
+            "1. Выбери один business_process из списка.\n"
+            "2. Верни ordered planned_tools: tools должны быть только из выбранного process.\n"
+            "3. auth_context всегда должен быть первым tool плана.\n"
+            "4. write_audit должен завершать успешно выполненный business process.\n"
+            "5. Не придумывай tools, аргументы, права доступа или источники.\n"
+            "6. Используй только данные state, observations и список skills.\n"
+            "7. Рискованные действия не подтверждай сам: MCP tool сам остановит "
             "граф и запросит подтверждение пользователя.\n"
-            "7. finish выбирай только если все нужные skills выполнены или state.stop=true.\n\n"
+            "8. Если пользователь просит часть работы, можно вернуть подмножество tools, "
+            "но не пропускай зависимости.\n\n"
             "Формат ответа - только JSON без markdown:\n"
             "{\n"
-            '  "thought": "почему выбран этот tool",\n'
-            '  "tool": "technical_tool_name_or_finish",\n'
+            '  "thought": "почему выбран этот business process и такой план",\n'
+            '  "business_process": "process_id",\n'
             '  "planned_tools": ["ordered", "technical", "tool", "names"]\n'
             "}"
         )
@@ -262,7 +330,7 @@ class ResearchAgent:
         )
         graph.add_edge("toolnode", "agent")
 
-        return graph.compile()
+        return graph.compile(checkpointer=self.checkpointer)
 
     def run(
         self,
@@ -270,12 +338,56 @@ class ResearchAgent:
         message,
         user_arguments=None,
         confirmations=None,
+        thread_id=None,
     ):
         """Запустить агентный сценарий для пользовательского запроса."""
 
+        thread_id = thread_id or str(uuid.uuid4())
         auth_context = self.security.get_auth_context(access_token)
-        state = {
+        state = self.build_initial_state(
+            thread_id,
+            access_token,
+            message,
+            auth_context,
+            user_arguments,
+            confirmations,
+        )
+
+        if thread_id in self.thread_states:
+            state = self.build_resume_state(
+                self.thread_states[thread_id],
+                access_token,
+                message,
+                auth_context,
+                user_arguments,
+                confirmations,
+            )
+
+        config = {
+            "recursion_limit": 50,
+            "configurable": {
+                "thread_id": thread_id,
+            },
+        }
+        result = self.graph.invoke(state, config)
+        self.remember_thread_state(thread_id, result)
+
+        return result
+
+    def build_initial_state(
+        self,
+        thread_id,
+        access_token,
+        message,
+        auth_context,
+        user_arguments=None,
+        confirmations=None,
+    ):
+        """Собрать новый state для первого запуска thread."""
+
+        return {
             "access_token": access_token,
+            "thread_id": thread_id,
             "message": message,
             "user_arguments": user_arguments or {},
             "confirmations": confirmations or {},
@@ -288,12 +400,74 @@ class ResearchAgent:
             "planned_tasks": [],
             "created_tasks": [],
             "scenario_tools": self.scenario_tools,
+            "business_processes": self.business_processes,
+            "selected_business_process": "",
             "current_tool_index": 0,
             "completed_tools": [],
             "llm_plan": [],
             "llm_decisions": [],
         }
-        return self.graph.invoke(state, {"recursion_limit": 50})
+
+    def build_resume_state(
+        self,
+        saved_state,
+        access_token,
+        message,
+        auth_context,
+        user_arguments=None,
+        confirmations=None,
+    ):
+        """Продолжить сохранённый state после tool interrupt без replay шагов."""
+
+        state = copy.deepcopy(saved_state)
+        state["access_token"] = access_token
+        state["auth_context"] = auth_context
+
+        if message:
+            state["message"] = message
+
+        state["user_arguments"] = {
+            **state.get("user_arguments", {}),
+            **(user_arguments or {}),
+        }
+        state["confirmations"] = {
+            **state.get("confirmations", {}),
+            **(confirmations or {}),
+        }
+
+        for key in [
+            "waiting_for_user",
+            "requires_confirmation",
+            "stop",
+            "pending_question",
+            "pending_confirmation",
+            "missing_arguments",
+            "final_answer",
+            "next_tool",
+        ]:
+            if key in ["waiting_for_user", "requires_confirmation", "stop"]:
+                state[key] = False
+            else:
+                state.pop(key, None)
+
+        state.setdefault("react_trace", []).append(
+            {
+                "thought": "Возобновление сохранённого thread state после interrupt.",
+                "action": "resume",
+                "tool_index": state.get("current_tool_index", 0),
+            }
+        )
+
+        return state
+
+    def remember_thread_state(self, thread_id, state):
+        """Сохранить interrupted state или очистить завершённый thread."""
+
+        if state.get("waiting_for_user"):
+            self.thread_states[thread_id] = copy.deepcopy(state)
+            return
+
+        self.thread_states.pop(thread_id, None)
 
     def agent_node(self, state):
         """Нода agent через LLM выбирает следующую функцию из skills."""
@@ -305,27 +479,40 @@ class ResearchAgent:
             state["next_tool"] = "finish"
             return state
 
-        if state["current_tool_index"] >= len(state["scenario_tools"]):
+        if not state.get("llm_plan"):
+            decision = self.plan_business_process(state)
+            state["selected_business_process"] = decision["business_process"]
+            state["llm_plan"] = decision["planned_tools"]
+            state["llm_decisions"].append(decision)
+            state["react_trace"].append(
+                {
+                    "thought": decision["thought"],
+                    "business_process": decision["business_process"],
+                    "action": "plan_tools",
+                    "planned_tools": decision["planned_tools"],
+                    "source": decision["source"],
+                }
+            )
+
+        if state["current_tool_index"] >= len(state.get("llm_plan", [])):
             state["next_tool"] = "finish"
             return state
 
-        decision = self.select_next_tool(state)
-        state["next_tool"] = decision["tool"]
-        state["llm_plan"] = decision.get("planned_tools", [])
-        state["llm_decisions"].append(decision)
+        tool_name = state["llm_plan"][state["current_tool_index"]]
+        state["next_tool"] = tool_name
         state["react_trace"].append(
             {
-                "thought": decision["thought"],
-                "tool": decision["tool"],
+                "thought": "Выбран следующий tool из LLM-плана.",
+                "tool": tool_name,
                 "action": "select_tool",
-                "source": decision["source"],
+                "source": "llm_plan",
             }
         )
 
         return state
 
-    def select_next_tool(self, state):
-        """Получить LLM-решение и привести его к валидному ReAct action."""
+    def plan_business_process(self, state):
+        """Получить LLM-план business process и привести его к валидному виду."""
 
         raw_response = ""
         try:
@@ -347,12 +534,14 @@ class ResearchAgent:
         snapshot = {
             "user_message": state.get("message", ""),
             "completed_tools": state.get("completed_tools", []),
-            "remaining_tools": self.remaining_scenario_tools(state),
+            "available_business_processes": state.get(
+                "business_processes",
+                self.business_processes,
+            ),
             "current_observations": self.build_observation_snapshot(state),
-            "existing_llm_plan": state.get("llm_plan", []),
         }
         return (
-            "Выбери следующий ReAct Action для текущего состояния.\n"
+            "Выбери business process и сформируй последовательность MCP tools.\n"
             "Ответь строго JSON по системной схеме.\n\n"
             f"State:\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
         )
@@ -421,53 +610,54 @@ class ResearchAgent:
         return {"validation_error": "json_object_not_found"}
 
     def validate_llm_decision(self, state, decision, raw_response):
-        """Проверить tool от LLM и при необходимости заменить fallback action."""
+        """Проверить business process и tool plan от LLM."""
 
-        fallback_tool = self.next_scenario_tool(state)
-        requested_tool = decision.get("tool")
-        planned_tools = self.normalize_planned_tools(decision.get("planned_tools", []))
+        process = self.find_business_process(decision.get("business_process"))
+        fallback_used = False
         validation_error = decision.get("validation_error")
 
-        if state.get("stop"):
-            requested_tool = "finish"
-        elif requested_tool != fallback_tool:
-            validation_error = validation_error or (
-                f"expected_{fallback_tool}_got_{requested_tool}"
-            )
-            requested_tool = fallback_tool
+        if process is None:
+            process = self.default_business_process()
+            fallback_used = True
+            validation_error = validation_error or "unknown_business_process"
 
-        if requested_tool not in self.allowed_tool_names():
-            validation_error = validation_error or f"unknown_tool:{requested_tool}"
-            requested_tool = fallback_tool
-
+        planned_tools = self.normalize_planned_tools(
+            decision.get("planned_tools", []),
+            process,
+        )
         if not planned_tools:
-            planned_tools = self.remaining_scenario_tools(state)
+            planned_tools = list(process.get("recommended_sequence", []))
+            fallback_used = True
+            validation_error = validation_error or "empty_or_invalid_tool_plan"
+
+        planned_tools = self.apply_plan_safety_rules(planned_tools)
 
         source = "llm"
-        thought = decision.get("thought") or "LLM выбрала следующий tool из skills."
-        if validation_error:
+        thought = decision.get("thought") or (
+            "LLM выбрала business process и сформировала tool plan."
+        )
+        if fallback_used:
             source = "fallback"
             thought = (
-                "LLM-решение не прошло валидацию; выбран следующий валидный "
-                "tool из skills."
+                "LLM-план не прошёл валидацию; выбран fallback plan из skills."
             )
 
         return {
             "thought": thought,
-            "tool": requested_tool,
+            "business_process": process["id"],
             "planned_tools": planned_tools,
             "source": source,
             "raw_response": raw_response,
             "validation_error": validation_error,
         }
 
-    def normalize_planned_tools(self, planned_tools):
-        """Оставить в плане только известные technical tool names."""
+    def normalize_planned_tools(self, planned_tools, process):
+        """Оставить в плане только tools выбранного business process."""
 
         if not isinstance(planned_tools, list):
             return []
 
-        known_tools = self.allowed_tool_names()
+        known_tools = {tool["name"] for tool in process.get("tools", [])}
         normalized_tools = []
         for tool_name in planned_tools:
             if tool_name in known_tools and tool_name not in normalized_tools:
@@ -475,27 +665,73 @@ class ResearchAgent:
 
         return normalized_tools
 
+    def apply_plan_safety_rules(self, planned_tools):
+        """Добавить обязательные safety tools без жёсткой бизнес-последовательности."""
+
+        safe_plan = list(planned_tools)
+
+        if "auth_context" in self.allowed_tool_names() and (
+            not safe_plan or safe_plan[0] != "auth_context"
+        ):
+            safe_plan = ["auth_context"] + [
+                tool_name for tool_name in safe_plan if tool_name != "auth_context"
+            ]
+
+        if "write_audit" in self.allowed_tool_names() and "write_audit" not in safe_plan:
+            safe_plan.append("write_audit")
+
+        return safe_plan
+
     def allowed_tool_names(self):
         """Вернуть множество допустимых имен tools и finish."""
 
-        return {tool["name"] for tool in self.scenario_tools} | {"finish"}
+        tool_names = set()
+        for process in self.business_processes:
+            for tool in process.get("tools", []):
+                tool_names.add(tool["name"])
+        return tool_names | {"finish"}
+
+    def default_business_process(self):
+        """Вернуть первый business process как fallback MVP."""
+
+        if not self.business_processes:
+            return {
+                "id": "empty_business_process",
+                "name": "empty",
+                "description": "",
+                "tools": [],
+                "recommended_sequence": [],
+            }
+
+        return self.business_processes[0]
+
+    def find_business_process(self, process_id):
+        """Найти business process по id."""
+
+        for process in self.business_processes:
+            if process["id"] == process_id:
+                return process
+        return None
 
     def next_scenario_tool(self, state):
-        """Вернуть следующий обязательный tool в последовательности skills."""
+        """Вернуть следующий tool из LLM-плана или finish."""
 
         current_index = state.get("current_tool_index", 0)
-        scenario_tools = state.get("scenario_tools", self.scenario_tools)
-        if current_index >= len(scenario_tools):
+        tool_plan = state.get("llm_plan", [])
+        if current_index >= len(tool_plan):
             return "finish"
 
-        return scenario_tools[current_index]["name"]
+        return tool_plan[current_index]
 
     def remaining_scenario_tools(self, state):
-        """Вернуть оставшуюся последовательность technical tool names."""
+        """Вернуть оставшуюся последовательность tool names."""
 
         current_index = state.get("current_tool_index", 0)
-        scenario_tools = state.get("scenario_tools", self.scenario_tools)
-        return [tool["name"] for tool in scenario_tools[current_index:]]
+        tool_plan = state.get("llm_plan", [])
+        if tool_plan:
+            return tool_plan[current_index:]
+
+        return list(self.default_business_process().get("recommended_sequence", []))
 
     def route_after_agent(self, state):
         """Решить, идти ли в toolnode или завершать граф."""
@@ -572,6 +808,7 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
                 body.get("message", ""),
                 body.get("user_arguments", {}),
                 body.get("confirmations", {}),
+                body.get("thread_id"),
             )
             self.send_json(result)
             return

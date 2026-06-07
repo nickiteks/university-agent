@@ -12,8 +12,8 @@ MVP агентной архитектуры для AI-платформы уни�
 2. Security service проверяет токен, роли и группы пользователя.
 3. Security service возвращает агенту список разрешённых действий и документов.
 4. LangGraph-агент передаёт `skills.txt` и текущий `state` в LLM через `VLLMClient`.
-5. LLM выбирает следующий ReAct action: MCP tool из skills или `finish`.
-6. Tool node вызывает выбранный MCP tool по имени, передавая ему текущий `state`.
+5. LLM выбирает business process из skills и формирует ordered `planned_tools`.
+6. Tool node по очереди вызывает MCP tools из LLM-плана, передавая текущий `state`.
 7. Если аргументов или подтверждения не хватает, tool делает interrupt и возвращает вопрос пользователю.
 8. MCP tools выполняют поиск знаний, проверку требований, подготовку задач и черновика письма.
 9. LLM используется только через отдельный gateway-контур `Envoy -> LiteLLM -> vLLM -> Qwen`.
@@ -35,7 +35,7 @@ Security service
 Agent service
   |
   |-- LangGraph: agent <-> toolnode
-  |-- ReAct: LLM выбирает следующий MCP tool из skills
+  |-- ReAct: LLM выбирает business process и tool plan из skills
   |-- VLLMClient: Agent -> Envoy -> LiteLLM -> vLLM/Qwen
   |-- skills.txt: сценарий выполнения
   |
@@ -83,7 +83,7 @@ security/
 
 agent/
   agent.py         - LangGraph agent service
-  skills.txt       - бизнес-сценарий, который проходит агент
+  skills.txt       - business processes, tools и рекомендуемые последовательности
   requirements.txt - зависимости агента
   Dockerfile       - контейнер agent service
 
@@ -149,16 +149,18 @@ POST /authz/filter-documents
 agent <-> toolnode
 ```
 
-`agent` вызывает `VLLMClient`, передаёт системный ReAct prompt, текущий `state` и список skills, а LLM выбирает следующий MCP tool или `finish`. `toolnode` вызывает выбранный MCP tool. Цикл идёт, пока агент не пройдёт нужную последовательность skills или tool не остановит граф через interrupt.
+`agent` вызывает `VLLMClient`, передаёт системный ReAct prompt, текущий `state` и business processes из `skills.txt`, а LLM выбирает business process и ordered `planned_tools`. `toolnode` вызывает MCP tools из этого плана по очереди. Цикл идёт, пока агент не пройдёт LLM-план или tool не остановит граф через interrupt.
 
 Агент реализован как простой ReAct-контур:
 
-- `Thought` - LLM объясняет, почему выбран следующий tool;
+- `Thought` - LLM объясняет, почему выбран business process и такой tool plan;
 - `Action` - `toolnode` вызывает выбранный MCP tool по имени;
 - `Observation` - результат tool сохраняется в state;
 - `Interrupt` - сам MCP tool останавливает граф, если ему не хватает аргументов или нужно подтверждение риска.
 
-LLM-решение ожидается в JSON-формате с полями `thought`, `tool`, `planned_tools`. Агент валидирует ответ модели: tool должен быть известным skill и соответствовать текущей допустимой последовательности. Если LLM вернула пустой, невалидный или небезопасный action, агент использует fallback на следующий валидный skill.
+LLM-решение ожидается в JSON-формате с полями `thought`, `business_process`, `planned_tools`. Агент валидирует ответ модели: business process должен существовать в `skills.txt`, а tools должны входить в выбранный process. Агент не навязывает фиксированный бизнес-порядок, но добавляет safety-границы: `auth_context` первым и `write_audit` в конце, если модель их пропустила. Если LLM вернула пустой или невалидный план, агент использует fallback на рекомендуемую последовательность из `skills.txt`.
+
+Interrupts являются resumable по `thread_id`: агент сохраняет interrupted state в LangGraph checkpointer и локальном thread store. Повторный `/agent/run` с тем же `thread_id` мержит новые `user_arguments` или `confirmations` в сохранённый state и продолжает с остановленного tool index. Уже выполненные tools не переигрываются.
 
 Важно: в `agent.py` нет бизнес-реализаций tools. Проверка недостающих аргументов и подтверждений живёт в MCP tools. Это соответствует ТЗ: tool сам знает, какие аргументы ему нужны, и сам решает, можно ли продолжать выполнение.
 
@@ -194,7 +196,7 @@ MCP-сервис на FastMCP. Это контрактный слой между
 Agent/MCP tool -> Envoy -> LiteLLM -> vLLM(Qwen)
 ```
 
-Клиент используется агентом для выбора ReAct action из skills и MCP tool `prepare_email_draft` для подготовки текста черновика письма.
+Клиент используется агентом для выбора business process и tool plan из skills, а также MCP tool `prepare_email_draft` для подготовки текста черновика письма.
 
 ## Запуск полного контура
 
@@ -281,6 +283,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ```json
 {
+  "thread_id": "manual-run-1",
   "message": "Помоги подготовить пакет для подачи заявки на внутренний научный проект. Найди регламенты, проверь требования, собери список недостающих документов, предложи структуру заявки, подготовь задачи соавторам и черновик письма.",
   "user_arguments": {},
   "confirmations": {}
@@ -291,6 +294,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ```json
 {
+  "thread_id": "manual-run-1",
   "waiting_for_user": true,
   "pending_question": {
     "type": "missing_arguments",
@@ -309,6 +313,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ```json
 {
+  "thread_id": "manual-run-1",
   "waiting_for_user": true,
   "requires_confirmation": true,
   "pending_question": {
@@ -324,12 +329,13 @@ curl -s http://localhost:8080/v1/chat/completions \
 }
 ```
 
-Для продолжения клиент повторяет `/agent/run` с нужными `user_arguments` или `confirmations`.
+Для продолжения клиент повторяет `/agent/run` с тем же `thread_id` и нужными `user_arguments` или `confirmations`. Агент продолжит сохранённый state с interrupted tool, а не начнёт бизнес-процесс заново.
 
 Пример подтверждения создания задач:
 
 ```json
 {
+  "thread_id": "manual-run-1",
   "message": "Подготовь заявку и создай задачи соавторам",
   "confirmations": {
     "prepare_tasks": true
@@ -391,8 +397,8 @@ LLM_TIMEOUT_SECONDS=60
 - Qwen как LLM-модель.
 - LangGraph для агента.
 - Граф агента только из двух нод: `agent` и `toolnode`.
-- ReAct-поведение: LLM выбирает action, toolnode выполняет tool, observation сохраняется в state.
-- Tool-level interrupts для недостающих аргументов и подтверждений.
+- ReAct-поведение: LLM выбирает business process и tool plan, toolnode выполняет tools, observation сохраняется в state.
+- Resumable tool-level interrupts для недостающих аргументов и подтверждений.
 - Tools сами проверяют недостающие аргументы и необходимость подтверждения.
 - MCP слой для инструментов.
 - Fake DB только для прикладных данных.

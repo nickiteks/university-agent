@@ -83,12 +83,12 @@ class TestAgentLLMClient:
             }
         )
         state = self.extract_state(user_prompt)
-        tool_name = state["remaining_tools"][0]
+        process = state["available_business_processes"][0]
         return json.dumps(
             {
-                "thought": "Выбираю следующий tool из skills.",
-                "tool": tool_name,
-                "planned_tools": state["remaining_tools"],
+                "thought": "Выбираю business process и полный план tools.",
+                "business_process": process["id"],
+                "planned_tools": process["recommended_sequence"],
             },
             ensure_ascii=False,
         )
@@ -99,16 +99,26 @@ class TestAgentLLMClient:
         return json.loads(state_json)
 
 
-class WrongToolAgentLLMClient:
+class ReorderedPlanAgentLLMClient:
     def complete(self, system_prompt, user_prompt):
         return json.dumps(
             {
-                "thought": "Ошибочно выбираю финальный аудит слишком рано.",
-                "tool": "write_audit",
+                "thought": "Выбираю короткий план только для аудита.",
+                "business_process": "prepare_internal_research_application",
                 "planned_tools": ["write_audit"],
             },
             ensure_ascii=False,
         )
+
+
+class CountingMCPClient:
+    def __init__(self):
+        self.inner = MCPClient()
+        self.calls = []
+
+    def call_tool(self, tool_name, arguments):
+        self.calls.append(tool_name)
+        return self.inner.call_tool(tool_name, arguments)
 
 
 class ResearchAgentTest(unittest.TestCase):
@@ -147,9 +157,14 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(1, len(result["planned_tasks"]))
         self.assertEqual("email_draft_1", result["email_draft"]["id"])
         self.assertEqual(1, len(self.llm.calls))
-        self.assertEqual(len(self.agent.scenario_tools), len(self.agent_llm.calls))
+        self.assertEqual(1, len(self.agent_llm.calls))
         self.assertIn("ReAct-агент", self.agent_llm.calls[0]["system_prompt"])
         self.assertIn("auth_context", self.agent_llm.calls[0]["system_prompt"])
+        self.assertEqual(expected_tools, result["llm_plan"])
+        self.assertEqual(
+            "prepare_internal_research_application",
+            result["selected_business_process"],
+        )
         self.assertIn("doc_reg_internal_2026", [source["id"] for source in result["sources"]])
 
     def test_agent_creates_tasks_after_confirmation(self):
@@ -197,6 +212,31 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("search_knowledge", result["completed_tools"])
         self.assertIn("doc_reg_internal_2026", [source["id"] for source in result["sources"]])
 
+    def test_resume_after_missing_argument_does_not_replay_completed_tools(self):
+        mcp = CountingMCPClient()
+        llm = TestAgentLLMClient()
+        agent = ResearchAgent(
+            security_client=TestSecurityClient(),
+            mcp_client=mcp,
+            llm_client=llm,
+        )
+
+        first = agent.run("valid-token", "", thread_id="resume-query")
+        resumed = agent.run(
+            "valid-token",
+            "",
+            user_arguments={"query": "регламент внутреннего научного проекта"},
+            thread_id="resume-query",
+        )
+
+        self.assertTrue(first["waiting_for_user"])
+        self.assertFalse(resumed["waiting_for_user"])
+        self.assertEqual(1, mcp.calls.count("auth_context"))
+        self.assertEqual(1, mcp.calls.count("detect_intent"))
+        self.assertEqual(2, mcp.calls.count("search_knowledge"))
+        self.assertIn("write_audit", resumed["completed_tools"])
+        self.assertEqual(1, len(llm.calls))
+
     def test_agent_does_not_create_tasks_without_permission(self):
         agent = ResearchAgent(
             security_client=TestSecurityClient(permissions=["documents.read", "email.draft"]),
@@ -226,24 +266,82 @@ class ResearchAgentTest(unittest.TestCase):
         result = self.agent.run("valid-token", "Подготовь заявку")
 
         expected_tools = [tool["name"] for tool in self.agent.scenario_tools]
-        selected_tools = [decision["tool"] for decision in result["llm_decisions"]]
-
-        self.assertEqual(expected_tools, selected_tools)
+        self.assertEqual(expected_tools, result["llm_plan"])
+        self.assertEqual(1, len(result["llm_decisions"]))
+        self.assertEqual(
+            "prepare_internal_research_application",
+            result["llm_decisions"][0]["business_process"],
+        )
         self.assertEqual("llm", result["llm_decisions"][0]["source"])
-        self.assertEqual("select_tool", result["react_trace"][0]["action"])
+        self.assertEqual("plan_tools", result["react_trace"][0]["action"])
 
-    def test_agent_falls_back_when_llm_selects_invalid_tool_order(self):
+    def test_agent_uses_llm_plan_without_strict_business_order(self):
         agent = ResearchAgent(
             security_client=TestSecurityClient(),
             mcp_client=MCPClient(),
-            llm_client=WrongToolAgentLLMClient(),
+            llm_client=ReorderedPlanAgentLLMClient(),
         )
 
         result = agent.run("valid-token", "Подготовь заявку")
 
-        self.assertEqual("auth_context", result["llm_decisions"][0]["tool"])
-        self.assertEqual("fallback", result["llm_decisions"][0]["source"])
-        self.assertEqual("auth_context", result["completed_tools"][0])
+        self.assertEqual(["auth_context", "write_audit"], result["llm_plan"])
+        self.assertEqual("llm", result["llm_decisions"][0]["source"])
+        self.assertEqual(["auth_context", "write_audit"], result["completed_tools"])
+
+    def test_resume_after_confirmation_does_not_replay_completed_tools(self):
+        mcp = CountingMCPClient()
+        llm = TestAgentLLMClient()
+        agent = ResearchAgent(
+            security_client=TestSecurityClient(),
+            mcp_client=mcp,
+            llm_client=llm,
+        )
+
+        first = agent.run(
+            "valid-token",
+            "Подготовь заявку и создай задачи соавторам",
+            thread_id="resume-confirmation",
+        )
+        resumed = agent.run(
+            "valid-token",
+            "Подготовь заявку и создай задачи соавторам",
+            confirmations={"prepare_tasks": True},
+            thread_id="resume-confirmation",
+        )
+
+        self.assertTrue(first["waiting_for_user"])
+        self.assertFalse(resumed["waiting_for_user"])
+        self.assertEqual(1, mcp.calls.count("auth_context"))
+        self.assertEqual(1, mcp.calls.count("detect_intent"))
+        self.assertEqual(1, mcp.calls.count("list_missing_documents"))
+        self.assertEqual(2, mcp.calls.count("prepare_tasks"))
+        self.assertEqual(1, len(llm.calls))
+        self.assertEqual(1, len(resumed["created_tasks"]))
+
+    def test_skills_parser_supports_multiple_business_processes(self):
+        self.agent.skills_text = (
+            "Скилл: первый процесс\n"
+            "process_id: first\n"
+            "Доступные tools бизнес-процесса:\n"
+            "- auth_context: проверить доступ.\n"
+            "- write_audit: записать аудит.\n"
+            "auth_context -> write_audit\n\n"
+            "Скилл: второй процесс\n"
+            "process_id: second\n"
+            "Доступные tools бизнес-процесса:\n"
+            "- auth_context: проверить доступ.\n"
+            "- search_knowledge: найти документы.\n"
+            "- write_audit: записать аудит.\n"
+            "auth_context -> search_knowledge -> write_audit\n"
+        )
+
+        processes = self.agent.load_business_processes()
+
+        self.assertEqual(["first", "second"], [process["id"] for process in processes])
+        self.assertEqual(
+            ["auth_context", "search_knowledge", "write_audit"],
+            processes[1]["recommended_sequence"],
+        )
 
     def test_agent_uses_only_allowed_sources(self):
         result = self.agent.run("valid-token", "Найди регламенты и памятки")
